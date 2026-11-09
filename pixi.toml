@@ -1,0 +1,56 @@
+[workspace]
+authors = ["Shreyas Sathyamangalam"]
+channels = ["conda-forge"]
+name = "m5-forecasting"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+# Shared scientific and notebook tooling.
+[feature.common.dependencies]
+python = "3.12.*"
+numpy = ">=2.0,<2.6"
+pyarrow = ">=18,<25"
+polars = ">=1.17,<2"
+matplotlib = ">=3.8,<3.12"
+seaborn = ">=0.13,<0.14"
+scipy = ">=1.13,<1.19"
+scikit-learn = ">=1.5,<2"
+statsmodels = ">=0.14,<1"
+duckdb = ">=1.2,<2"
+
+[feature.common.pypi-dependencies]
+marimo = ">=0.25,<1"
+
+# Main forecasting environment: latest pandas 3.x line.
+[feature.forecasting.dependencies]
+pandas = ">=3.0,<4"
+
+[feature.forecasting.pypi-dependencies]
+torch = ">=2.4,<3"
+statsforecast = { git = "https://github.com/Nixtla/statsforecast.git" }
+utilsforecast = ">=0.2,<1"
+# Timestral currently has no published GitHub release tag. The Pixi lockfile
+# will pin the resolved Git revision for reproducible installs.
+timestral = { git = "https://github.com/mistralai/timestral.git" }
+
+[feature.forecasting.tasks]
+check-env = "python scripts/check_forecasting_env.py"
+forecast-notebook = "marimo edit notebooks/02_m5_baselines.py"
+
+# EDA-only environment: fg-data-profiling currently requires pandas <3.
+# Keeping this environment separate avoids constraining the forecasting stack.
+[feature.eda.dependencies]
+pandas = ">=2.2.3,<3"
+
+[feature.eda.pypi-dependencies]
+fg-data-profiling = ">=4.20,<5"
+skimpy = ">=0.0.22,<0.1"
+dtale = ">=3.22,<4"
+
+[feature.eda.tasks]
+check-env = "python scripts/check_eda_env.py"
+eda-notebook = "marimo edit notebooks/01_m5_eda.py"
+
+[environments]
+default = ["common", "forecasting"]
+eda = ["common", "eda"]
