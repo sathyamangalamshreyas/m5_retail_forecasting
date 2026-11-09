@@ -183,7 +183,7 @@ pyrightconfig.json
 .zed/session.json
 
 # Local data: retain directory structure, do not commit downloaded datasets
-*/data/*
+*data/*
 /data/processed/*
 !/data/processed/.gitkeep
 
