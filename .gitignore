@@ -190,7 +190,6 @@ pyrightconfig.json
 # Generated reports and forecasts
 /artifacts/*
 !/artifacts/.gitkeep
-/reports/*
 !/reports/.gitkeep
 
 # marimo generated files
