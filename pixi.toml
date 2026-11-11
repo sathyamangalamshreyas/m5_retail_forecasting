@@ -17,9 +17,19 @@ scipy = ">=1.13,<1.19"
 scikit-learn = ">=1.5,<2"
 statsmodels = ">=0.14,<1"
 duckdb = ">=1.2,<2"
+numba = ">=0.68.1,<1"
 
 [feature.common.pypi-dependencies]
 marimo = ">=0.25,<1"
+
+# Phase 0: CSV -> parquet + subset. Works in both environments (polars + numpy only).
+[feature.common.tasks.prep-data]
+cmd = "python -m m5_forecasting.data_prep"
+env = { PYTHONPATH = "src" }
+
+# Phase 1: subset profile (launches, live-adjusted intermittency, calendar, price, STUMPY readiness).
+[feature.common.tasks.phase1-notebook]
+cmd = "marimo edit notebooks/01b_m5_phase1_profile.py"
 
 # Main forecasting environment: latest pandas 3.x line.
 [feature.forecasting.dependencies]
@@ -41,9 +51,9 @@ forecast-notebook = "marimo edit notebooks/02_m5_baselines.py"
 # Keeping this environment separate avoids constraining the forecasting stack.
 [feature.eda.dependencies]
 pandas = ">=2.2.3,<3"
+stumpy = ">=1.14.1,<2"
 
 [feature.eda.pypi-dependencies]
-fg-data-profiling = ">=4.20,<5"
 skimpy = ">=0.0.22,<0.1"
 dtale = ">=3.22,<4"
 
