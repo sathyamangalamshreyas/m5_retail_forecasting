@@ -64,3 +64,7 @@ eda-notebook = "marimo edit notebooks/01_m5_eda.py"
 [environments]
 default = ["common", "forecasting"]
 eda = ["common", "eda"]
+
+[dependencies]
+nbconvert-webpdf = ">=7.17.2,<8"
+playwright = ">=1.65.0,<2"
