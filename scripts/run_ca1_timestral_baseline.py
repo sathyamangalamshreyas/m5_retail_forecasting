@@ -5,7 +5,7 @@ Expected inputs under data/processed/subsets/<subset>:
   sales.npy, price.npy, series.parquet
 
 The script preserves the original resumable batch inference and baseline outputs,
-then adds per-series, live-adjusted demand-class, forecast-horizon, and aggregate-bias diagnostics.
+then adds per-series, live-adjusted demand-class, forecast-horizon, daily aggregate, and demand-class cumulative-bias diagnostics.
 Demand classes are computed from training days only (d_1..d_1913).
 
 Run from the project root:
@@ -324,6 +324,43 @@ def _write_diagnostics(
         })
     pl.DataFrame(daily_rows).write_csv(out_dir / "daily_aggregate_diagnostics.csv")
 
+    # Step 5.2: daily and cumulative forecast errors by training-only demand class.
+    # Errors are forecast minus actual; negative values indicate underforecasting.
+    class_daily_rows: list[dict[str, object]] = []
+    class_names = ["Smooth", "Erratic", "Intermittent", "Lumpy", "NoSales", "Unclassified"]
+    for demand_class in class_names:
+        idx = np.flatnonzero(classes == demand_class)
+        if idx.size == 0:
+            continue
+        cumulative_actual = 0.0
+        cumulative_forecasts = {"SeasonalNaive7": 0.0, "Timestral": 0.0}
+        for day in range(HORIZON):
+            actual_class_day = float(actual[idx, day].sum())
+            cumulative_actual += actual_class_day
+            for model, point in (("SeasonalNaive7", naive_point), ("Timestral", ts_point)):
+                forecast_class_day = float(point[idx, day].sum())
+                cumulative_forecasts[model] += forecast_class_day
+                daily_error = forecast_class_day - actual_class_day
+                cumulative_error = cumulative_forecasts[model] - cumulative_actual
+                class_daily_rows.append({
+                    "demand_class": demand_class,
+                    "horizon_day": day + 1,
+                    "m5_day": f"d_{TRAIN_DAYS + day + 1}",
+                    "model": model,
+                    "n_series": int(idx.size),
+                    "actual_units": actual_class_day,
+                    "forecast_units": forecast_class_day,
+                    "daily_error_units": daily_error,
+                    "daily_error_pct_actual": 100.0 * daily_error / actual_class_day
+                        if actual_class_day > 0 else float("nan"),
+                    "cumulative_actual_units": cumulative_actual,
+                    "cumulative_forecast_units": cumulative_forecasts[model],
+                    "cumulative_error_units": cumulative_error,
+                    "cumulative_error_pct_actual": 100.0 * cumulative_error / cumulative_actual
+                        if cumulative_actual > 0 else float("nan"),
+                })
+    pl.DataFrame(class_daily_rows).write_csv(out_dir / "demand_class_daily_cumulative_diagnostics.csv")
+
     # Keep series with no actual demand in the full holdout in a dedicated
     # file. Their percentage improvements are not meaningful when the
     # denominator (actual demand) is zero.
@@ -333,7 +370,8 @@ def _write_diagnostics(
 
     print("\nWrote diagnostics:")
     for name in ("per_series_diagnostics.csv", "demand_class_diagnostics.csv", "horizon_diagnostics.csv",
-                 "daily_aggregate_diagnostics.csv", "zero_actual_28d_series.csv"):
+                 "daily_aggregate_diagnostics.csv", "demand_class_daily_cumulative_diagnostics.csv",
+                 "zero_actual_28d_series.csv"):
         print(f"  {out_dir / name}")
 
 
