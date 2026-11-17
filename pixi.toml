@@ -61,10 +61,22 @@ dtale = ">=3.22,<4"
 check-env = "python scripts/check_eda_env.py"
 eda-notebook = "marimo edit notebooks/01_m5_eda.py"
 
+[feature.gam.dependencies]
+r-base = ">=4.5,<4.6"
+r-mgcv = ">=1.9,<2"
+rpy2 = ">=3.6,<3.7"
+
+[feature.gam.pypi-dependencies]
+pymgcv = "==0.0.10"
+
+[feature.gam-rust.pypi-dependencies]
+mgcv-rust = "==0.23.2"
+
 [environments]
 default = ["common", "forecasting"]
 eda = ["common", "eda"]
-
+gam = ["common", "gam"]
+gam-rust = ["common", "gam-rust"]
 [dependencies]
 nbconvert-webpdf = ">=7.17.2,<8"
 playwright = ">=1.65.0,<2"
