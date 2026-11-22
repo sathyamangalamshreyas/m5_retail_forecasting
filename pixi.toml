@@ -87,3 +87,10 @@ playwright = ">=1.65.0,<2"
 tslearn = "==0.10.0"
 h5py = ">=3.16.0, <4"
 
+[feature.group-b.dependencies]
+networkx = ">=3.4,<4"
+pytest = ">=9.2.0,<10"
+
+[environments.group-b]
+features = ["common", "group-b"]
+

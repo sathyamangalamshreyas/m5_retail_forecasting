@@ -1,0 +1,40 @@
+❯ pixi run --environment group-b python scripts/run_m5_group_b_graph_clustering.py --stage run
+Loading prepared M5 data: /Users/shreyas/Developer/tutorials/m5_forecasting/data/processed/clustering/d1387_728d
+  sales shape=(30490, 728); observed mask cells=18,760,373
+Extracted shape features: 29,359 eligible; 1,131 no-history rows retained as unassigned
+Building maximum directed k-NN distance graph (k=30) with sklearn.neighbors.kneighbors_graph ...
+  directed edges=880,770; elapsed=0.8s
+Graph knn_k15_union: edges=319,778; components=1; isolated=0
+  Spectral graph-k=15, K=3, seed=42: clusters=3, modularity=0.1086, 737.8s
+  Spectral graph-k=15, K=3, seed=43: clusters=3, modularity=0.1086, 736.1s
+  Spectral graph-k=15, K=6, seed=42: clusters=6, modularity=0.3122, 741.4s
+  Spectral graph-k=15, K=6, seed=43: clusters=6, modularity=0.3121, 793.1s
+  Spectral graph-k=15, K=10, seed=42: clusters=10, modularity=0.5334, 792.2s
+  Spectral graph-k=15, K=10, seed=43: clusters=10, modularity=0.5330, 825.4s
+  Louvain graph-k=15, resolution=0.5, seed=42: communities=10, modularity=0.7658, 6.1s
+  Louvain graph-k=15, resolution=0.5, seed=43: communities=10, modularity=0.7708, 4.6s
+  Louvain graph-k=15, resolution=1, seed=42: communities=18, modularity=0.7089, 7.1s
+  Louvain graph-k=15, resolution=1, seed=43: communities=19, modularity=0.7034, 8.2s
+  Louvain graph-k=15, resolution=1.5, seed=42: communities=24, modularity=0.6666, 5.0s
+  Louvain graph-k=15, resolution=1.5, seed=43: communities=24, modularity=0.6678, 5.5s
+Graph knn_k30_union: edges=639,678; components=1; isolated=0
+  Spectral graph-k=30, K=3, seed=42: clusters=3, modularity=0.1148, 579.7s
+  Spectral graph-k=30, K=3, seed=43: clusters=3, modularity=0.1143, 591.3s
+  Spectral graph-k=30, K=6, seed=42: clusters=6, modularity=0.3289, 586.2s
+  Spectral graph-k=30, K=6, seed=43: clusters=6, modularity=0.3289, 605.3s
+  Spectral graph-k=30, K=10, seed=42: clusters=10, modularity=0.5663, 618.9s
+  Spectral graph-k=30, K=10, seed=43: clusters=10, modularity=0.5662, 609.3s
+  Louvain graph-k=30, resolution=0.5, seed=42: communities=9, modularity=0.7561, 11.3s
+  Louvain graph-k=30, resolution=0.5, seed=43: communities=8, modularity=0.7476, 9.0s
+  Louvain graph-k=30, resolution=1, seed=42: communities=15, modularity=0.6831, 11.2s
+  Louvain graph-k=30, resolution=1, seed=43: communities=16, modularity=0.6809, 6.9s
+  Louvain graph-k=30, resolution=1.5, seed=42: communities=24, modularity=0.6384, 8.8s
+  Louvain graph-k=30, resolution=1.5, seed=43: communities=19, modularity=0.6454, 8.7s
+
+Group B graph clustering complete
+  Total source series retained: 30,490
+  With observed history:         29,359
+  No history (unassigned):       1,131
+  Successful clustering runs:    24
+  Output:                        /Users/shreyas/Developer/tutorials/m5_forecasting/data/processed/clustering/d1387_728d/group_b_graph
+  Elapsed:                       8330.9s
