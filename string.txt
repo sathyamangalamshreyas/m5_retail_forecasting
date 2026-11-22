@@ -1,0 +1,1 @@
+interval_type - pointwise coefficient-based 95% confidence interval transformed from link scale; not predictive interval

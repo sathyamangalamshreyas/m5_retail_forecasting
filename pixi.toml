@@ -76,7 +76,14 @@ mgcv-rust = "==0.23.2"
 default = ["common", "forecasting"]
 eda = ["common", "eda"]
 gam = ["common", "gam"]
-gam-rust = ["common", "gam-rust"]
+
+[environments.gam-rust]
+features = ["common", "gam-rust"]
+
+[environments.gam-rust.pypi-dependencies]
 [dependencies]
 nbconvert-webpdf = ">=7.17.2,<8"
 playwright = ">=1.65.0,<2"
+tslearn = "==0.10.0"
+h5py = ">=3.16.0, <4"
+

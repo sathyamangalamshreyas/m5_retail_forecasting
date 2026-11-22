@@ -1,0 +1,1084 @@
+#!/usr/bin/env python3
+"""Characterize selected variable-length tslearn Group A M5 cluster solutions.
+
+Characterizes the validation samples from the existing Group A search:
+  * DTW TimeSeriesKMeans + DBA: K=3
+  * GAK KernelKMeans: K=2, 3, 4
+
+No clustering is rerun. Seed labels are aligned to seed 42, and a per-series
+majority-vote consensus assignment is used for descriptive summaries. Outputs
+remain explicitly pilot/validation-sample characterizations, not full-M5 fits.
+
+Run from the M5 project root:
+    pixi run python scripts/characterize_m5_group_a_clusters.py --stage smoke-test
+    pixi run python scripts/characterize_m5_group_a_clusters.py --stage characterize
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import traceback
+from collections import Counter
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import polars as pl
+from scipy.optimize import linear_sum_assignment
+
+WINDOW_START_D = 660
+WINDOW_END_D = 1387
+WINDOW_DAYS = WINDOW_END_D - WINDOW_START_D + 1
+DEFAULT_DTW_K = [3]
+DEFAULT_GAK_K = [2, 3, 4]
+REFERENCE_SEED = 42
+WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def _json_default(value: Any):
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Cannot JSON-encode {type(value).__name__}")
+
+
+def _write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, default=_json_default) + "\n")
+
+
+def _as_date(value: Any) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, np.datetime64):
+        return date.fromisoformat(str(value)[:10])
+    return date.fromisoformat(str(value)[:10])
+
+
+def _representative_cluster_id(rep: dict[str, Any]) -> int:
+    """Return the cluster ID from a representative record.
+
+    Characterization feature records use ``consensus_cluster`` while exported
+    representative records also expose the canonical ``cluster`` field.
+    Supporting both keeps plotting resilient to either representation.
+    """
+    cluster = rep.get("cluster", rep.get("consensus_cluster"))
+    if cluster is None:
+        raise KeyError(
+            "Representative record must contain 'cluster' or 'consensus_cluster'; "
+            f"available keys: {sorted(rep)}"
+        )
+    return int(cluster)
+
+
+def _load_inputs(input_dir: Path):
+    needed = [
+        "sales_units.npy",
+        "sales_log1p.npy",
+        "observation_mask.npy",
+        "series_metadata.parquet",
+        "calendar_window.parquet",
+    ]
+    missing = [name for name in needed if not (input_dir / name).exists()]
+    if missing:
+        raise FileNotFoundError(f"Missing prepared inputs in {input_dir}: {missing}")
+
+    units = np.load(input_dir / "sales_units.npy", mmap_mode="r")
+    log_sales = np.load(input_dir / "sales_log1p.npy", mmap_mode="r")
+    mask = np.load(input_dir / "observation_mask.npy", mmap_mode="r")
+    metadata = pl.read_parquet(input_dir / "series_metadata.parquet")
+    calendar = pl.read_parquet(input_dir / "calendar_window.parquet").sort("d_num")
+
+    if units.shape != (30_490, WINDOW_DAYS):
+        raise ValueError(f"Unexpected sales_units shape: {units.shape}")
+    if log_sales.shape != units.shape or mask.shape != units.shape:
+        raise ValueError("Prepared sales arrays and mask must have identical shapes")
+    if metadata.height != units.shape[0]:
+        raise ValueError("Metadata row count differs from prepared arrays")
+    if calendar.height != WINDOW_DAYS:
+        raise ValueError(f"Expected {WINDOW_DAYS} calendar rows, got {calendar.height}")
+    if "row_index" not in metadata.columns:
+        raise ValueError("series_metadata.parquet must contain row_index")
+    if not np.array_equal(metadata["row_index"].to_numpy(), np.arange(units.shape[0])):
+        raise ValueError("Metadata row_index must match original array row order")
+
+    date_values = [_as_date(x) for x in calendar["date"].to_list()]
+    expected_d = list(range(WINDOW_START_D, WINDOW_END_D + 1))
+    if calendar["d_num"].to_list() != expected_d:
+        raise ValueError("calendar_window must contain d_660..d_1387 in order")
+
+    # Check the known continuous right-ending suffix property before using lags.
+    mask_np = np.asarray(mask, dtype=np.bool_)
+    lengths = mask_np.sum(axis=1).astype(np.int32)
+    for row in np.flatnonzero(lengths > 0):
+        first = int(np.flatnonzero(mask_np[row])[0])
+        if not mask_np[row, first:].all():
+            raise ValueError(
+                f"row_index={row} has internal/trailing missing observations; "
+                "this characterization expects a continuous suffix ending d_1387"
+            )
+
+    meta_rows = metadata.to_dicts()
+    meta_by_row = {int(rec["row_index"]): rec for rec in meta_rows}
+    return units, log_sales, mask_np, metadata, meta_by_row, date_values, lengths
+
+
+def _load_method_files(group_dir: Path, method: str):
+    method_dir = group_dir / ("dtw_kmeans_dba" if method == "dtw" else "gak_kernel_kmeans")
+    assignments_path = method_dir / "validation_assignments.csv"
+    manifest_path = method_dir / "samples" / "sample_manifest.json"
+    if not assignments_path.exists():
+        raise FileNotFoundError(f"Missing {assignments_path}")
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"Missing {manifest_path}. The original Group A search folder (including samples/) is required."
+        )
+    assignments = pl.read_csv(assignments_path)
+    manifest = json.loads(manifest_path.read_text())
+    sample_meta_path = method_dir / "samples" / "validation_sample_metadata.parquet"
+    if sample_meta_path.exists():
+        sample_metadata = pl.read_parquet(sample_meta_path)
+    else:
+        sample_metadata = None
+    return method_dir, assignments, manifest, sample_metadata
+
+
+def _align_one_seed(reference: np.ndarray, candidate: np.ndarray, k: int):
+    """Map candidate labels to reference labels via maximum-overlap Hungarian match."""
+    confusion = np.zeros((k, k), dtype=np.int64)
+    for ref, pred in zip(reference, candidate, strict=True):
+        if 0 <= int(ref) < k and 0 <= int(pred) < k:
+            confusion[int(pred), int(ref)] += 1
+    row_ind, col_ind = linear_sum_assignment(-confusion)
+    mapping = {int(pred): int(ref) for pred, ref in zip(row_ind, col_ind, strict=True)}
+    aligned = np.asarray([mapping.get(int(label), int(label)) for label in candidate], dtype=np.int32)
+    matched = int(confusion[row_ind, col_ind].sum())
+    return aligned, mapping, matched / max(1, len(reference)), confusion
+
+
+def _consensus_assignments(assignments: pl.DataFrame, k: int, method: str, expected_rows: list[int]):
+    subset = assignments.filter(pl.col("k") == k)
+    seeds = sorted(int(x) for x in subset["seed"].unique().to_list())
+    if len(seeds) < 2:
+        raise ValueError(f"Need at least two seed assignments for {method} K={k}; found {seeds}")
+    reference_seed = REFERENCE_SEED if REFERENCE_SEED in seeds else seeds[0]
+    by_seed: dict[int, dict[int, int]] = {}
+    for seed in seeds:
+        g = subset.filter(pl.col("seed") == seed).sort("row_index")
+        rows = [int(x) for x in g["row_index"].to_list()]
+        if rows != sorted(expected_rows):
+            raise ValueError(
+                f"Validation row set differs for {method} K={k} seed={seed}: "
+                f"expected {len(expected_rows)}, got {len(rows)}"
+            )
+        by_seed[seed] = {int(r): int(c) for r, c in zip(g["row_index"].to_list(), g["cluster"].to_list(), strict=True)}
+
+    row_order = sorted(expected_rows)
+    ref_labels = np.asarray([by_seed[reference_seed][r] for r in row_order], dtype=np.int32)
+    aligned_by_seed: dict[int, np.ndarray] = {reference_seed: ref_labels.copy()}
+    mappings = []
+    for seed in seeds:
+        if seed == reference_seed:
+            mappings.append({"seed": seed, "reference_seed": reference_seed, "label_mapping": json.dumps({i: i for i in range(k)}), "alignment_match_fraction": 1.0})
+            continue
+        cand = np.asarray([by_seed[seed][r] for r in row_order], dtype=np.int32)
+        aligned, mapping, match_fraction, _ = _align_one_seed(ref_labels, cand, k)
+        aligned_by_seed[seed] = aligned
+        mappings.append({
+            "seed": seed,
+            "reference_seed": reference_seed,
+            "label_mapping": json.dumps(mapping, sort_keys=True),
+            "alignment_match_fraction": float(match_fraction),
+        })
+
+    matrix = np.vstack([aligned_by_seed[s] for s in seeds]).T
+    consensus = np.empty(len(row_order), dtype=np.int32)
+    vote_fraction = np.empty(len(row_order), dtype=np.float32)
+    vote_count = np.empty(len(row_order), dtype=np.int8)
+    for i, votes in enumerate(matrix):
+        counts = Counter(int(v) for v in votes)
+        top = max(counts.values())
+        winners = [label for label, count in counts.items() if count == top]
+        # A tie can occur with three seeds if all predictions differ; prefer the reference label.
+        chosen = int(ref_labels[i]) if int(ref_labels[i]) in winners else min(winners)
+        consensus[i] = chosen
+        vote_count[i] = top
+        vote_fraction[i] = top / len(seeds)
+
+    aligned_rows = []
+    for i, row in enumerate(row_order):
+        rec = {"method": method, "k": k, "row_index": row, "reference_seed": reference_seed,
+               "consensus_cluster": int(consensus[i]), "consensus_votes": int(vote_count[i]),
+               "consensus_agreement": float(vote_fraction[i])}
+        for seed in seeds:
+            rec[f"seed_{seed}_aligned_cluster"] = int(aligned_by_seed[seed][i])
+        aligned_rows.append(rec)
+
+    return pl.DataFrame(aligned_rows), pl.DataFrame(mappings), seeds, reference_seed
+
+
+
+def _make_tslearn_sequences(rows: list[int], log_sales: np.ndarray, mask: np.ndarray):
+    from tslearn.utils import to_time_series_dataset
+
+    sequences = []
+    for row in rows:
+        observed = np.asarray(mask[row], dtype=bool)
+        values = np.asarray(log_sales[row, observed], dtype=np.float64)
+        if values.size == 0 or not np.isfinite(values).all():
+            raise ValueError(f"Invalid observed sequence for row_index={row}")
+        mean = float(values.mean())
+        scale = float(values.std())
+        z = np.zeros_like(values) if scale < 1e-8 else (values - mean) / scale
+        sequences.append(z[::-1].reshape(-1, 1))
+    return to_time_series_dataset(sequences), sequences
+
+
+def _load_search_hyperparameters(group_dir: Path, method_dir: Path):
+    search_manifest_path = group_dir / "group_a_search_manifest.json"
+    if search_manifest_path.exists():
+        manifest = json.loads(search_manifest_path.read_text())
+        return {
+            "seeds": [int(x) for x in manifest.get("seeds", [42, 43, 44])],
+            "n_init": int(manifest.get("n_init", 2)),
+            "max_iter": int(manifest.get("max_iter", 12)),
+            "max_iter_barycenter": int(manifest.get("max_iter_barycenter", 5)),
+            "n_jobs": int(manifest.get("n_jobs", 2)),
+            "source": str(search_manifest_path),
+        }
+    # Defaults are those of the Group A search script used for the uploaded run.
+    return {
+        "seeds": [42, 43, 44], "n_init": 2, "max_iter": 12,
+        "max_iter_barycenter": 5, "n_jobs": 2,
+        "source": "Group A search-script defaults (group_a_search_manifest.json not found)",
+    }
+
+
+def _fit_and_reconstruct(method: str, k: int, method_dir: Path, train_rows: list[int],
+                         validation_rows: list[int], log_sales: np.ndarray, mask: np.ndarray,
+                         search_params: dict[str, Any]):
+    """Recreate the saved pilot fit to recover training labels and model representatives."""
+    from sklearn.metrics import adjusted_rand_score
+
+    X_train, train_sequences = _make_tslearn_sequences(train_rows, log_sales, mask)
+    X_val, val_sequences = _make_tslearn_sequences(validation_rows, log_sales, mask)
+    seeds = [int(x) for x in search_params["seeds"]]
+    train_labels_by_seed: dict[int, np.ndarray] = {}
+    val_labels_by_seed: dict[int, np.ndarray] = {}
+    reference_centers = None
+    sigma = None
+
+    if method == "dtw":
+        from tslearn.clustering import TimeSeriesKMeans
+        for seed in seeds:
+            model = TimeSeriesKMeans(
+                n_clusters=k, metric="dtw", n_init=int(search_params["n_init"]),
+                max_iter=int(search_params["max_iter"]),
+                max_iter_barycenter=int(search_params["max_iter_barycenter"]),
+                random_state=seed, n_jobs=int(search_params["n_jobs"]), verbose=0,
+            )
+            model.fit(X_train)
+            train_labels_by_seed[seed] = np.asarray(model.labels_, dtype=np.int32)
+            val_labels_by_seed[seed] = np.asarray(model.predict(X_val), dtype=np.int32)
+            if seed == REFERENCE_SEED or (REFERENCE_SEED not in seeds and seed == seeds[0]):
+                reference_centers = np.asarray(model.cluster_centers_, dtype=np.float64)
+    else:
+        from tslearn.clustering import KernelKMeans
+        sigma_path = method_dir / "gak_manifest.json"
+        if not sigma_path.exists():
+            raise FileNotFoundError(f"Missing {sigma_path}; original GAK bandwidth is required")
+        sigma = float(json.loads(sigma_path.read_text())["sigma_gak"])
+        for seed in seeds:
+            model = KernelKMeans(
+                n_clusters=k, kernel="gak", kernel_params={"sigma": sigma},
+                n_init=int(search_params["n_init"]), max_iter=int(search_params["max_iter"]),
+                random_state=seed, n_jobs=int(search_params["n_jobs"]), verbose=0,
+            )
+            model.fit(X_train)
+            train_labels_by_seed[seed] = np.asarray(model.labels_, dtype=np.int32)
+            val_labels_by_seed[seed] = np.asarray(model.predict(X_val), dtype=np.int32)
+
+    return train_labels_by_seed, val_labels_by_seed, reference_centers, sigma, train_sequences, val_sequences
+
+
+def _combined_consensus(train_rows: list[int], validation_rows: list[int],
+                        train_labels_by_seed: dict[int, np.ndarray],
+                        val_labels_by_seed: dict[int, np.ndarray], k: int):
+    seeds = sorted(train_labels_by_seed)
+    reference_seed = REFERENCE_SEED if REFERENCE_SEED in seeds else seeds[0]
+    ref_train = train_labels_by_seed[reference_seed]
+    aligned_train: dict[int, np.ndarray] = {reference_seed: ref_train.copy()}
+    aligned_val: dict[int, np.ndarray] = {reference_seed: val_labels_by_seed[reference_seed].copy()}
+    mapping_rows = []
+
+    for seed in seeds:
+        if seed == reference_seed:
+            mapping_rows.append({"seed": seed, "reference_seed": reference_seed,
+                                 "label_mapping": json.dumps({i: i for i in range(k)}),
+                                 "training_alignment_match_fraction": 1.0})
+            continue
+        aligned_train_labels, mapping, match_fraction, _ = _align_one_seed(
+            ref_train, train_labels_by_seed[seed], k
+        )
+        aligned_train[seed] = aligned_train_labels
+        aligned_val[seed] = np.asarray(
+            [mapping.get(int(label), int(label)) for label in val_labels_by_seed[seed]],
+            dtype=np.int32,
+        )
+        mapping_rows.append({
+            "seed": seed, "reference_seed": reference_seed,
+            "label_mapping": json.dumps(mapping, sort_keys=True),
+            "training_alignment_match_fraction": float(match_fraction),
+        })
+
+    def consensus_for_rows(rows: list[int], by_seed: dict[int, np.ndarray], role: str):
+        matrix = np.vstack([by_seed[s] for s in seeds]).T
+        records = []
+        for i, row in enumerate(rows):
+            counts = Counter(int(x) for x in matrix[i])
+            top = max(counts.values())
+            winners = [label for label, count in counts.items() if count == top]
+            ref_label = int(by_seed[reference_seed][i])
+            chosen = ref_label if ref_label in winners else min(winners)
+            rec = {
+                "row_index": int(row), "sample_role": role,
+                "consensus_cluster": int(chosen), "consensus_votes": int(top),
+                "consensus_agreement": float(top / len(seeds)),
+                "reference_seed": int(reference_seed),
+            }
+            for seed in seeds:
+                rec[f"seed_{seed}_aligned_cluster"] = int(by_seed[seed][i])
+            records.append(rec)
+        return records
+
+    train_records = consensus_for_rows(train_rows, aligned_train, "train")
+    val_records = consensus_for_rows(validation_rows, aligned_val, "validation")
+    return pl.DataFrame(train_records + val_records), pl.DataFrame(mapping_rows), reference_seed
+
+
+def _validation_reproduction_check(method: str, k: int, seeds: list[int], validation_rows: list[int],
+                                  predicted: dict[int, np.ndarray], archived: pl.DataFrame):
+    """Compare reconstructed predictions to archived labels by row_index.
+
+    The archived table is sorted by row_index for deterministic diagnostics,
+    while predictions are returned in the original validation_rows order from
+    sample_manifest.json. Align them by row ID before calculating exact-match
+    fraction or ARI; comparing the arrays positionally creates a false mismatch.
+    """
+    from sklearn.metrics import adjusted_rand_score
+
+    subset = archived.filter(pl.col("k") == k)
+    expected_rows = [int(row) for row in validation_rows]
+    if len(expected_rows) != len(set(expected_rows)):
+        raise ValueError("Duplicate row_index values in validation_rows")
+
+    out = []
+    for seed in seeds:
+        g = subset.filter(pl.col("seed") == seed).sort("row_index")
+        archive_rows = [int(row) for row in g["row_index"].to_list()]
+        archived_labels = np.asarray(g["cluster"].to_list(), dtype=np.int32)
+        predicted_labels = np.asarray(predicted[seed], dtype=np.int32)
+
+        if len(predicted_labels) != len(expected_rows):
+            raise ValueError(
+                f"Prediction length differs for {method}, K={k}, seed={seed}: "
+                f"{len(predicted_labels)} predictions vs {len(expected_rows)} validation rows"
+            )
+        if len(archive_rows) != len(archived_labels):
+            raise ValueError(
+                f"Archived row/label length mismatch for {method}, K={k}, seed={seed}"
+            )
+        if len(archive_rows) != len(set(archive_rows)):
+            raise ValueError(
+                f"Duplicate archived row_index values for {method}, K={k}, seed={seed}"
+            )
+        if set(archive_rows) != set(expected_rows):
+            raise ValueError(
+                f"Validation row IDs differ for {method}, K={k}, seed={seed}: "
+                f"archived={len(archive_rows)}, expected={len(expected_rows)}"
+            )
+
+        # The prediction vector is in manifest order, whereas archived labels
+        # above are sorted by row_index. Re-key by row, then align to archive order.
+        predicted_by_row = {
+            int(row): int(label)
+            for row, label in zip(expected_rows, predicted_labels, strict=True)
+        }
+        ordered_predictions = np.asarray(
+            [predicted_by_row[row] for row in archive_rows], dtype=np.int32
+        )
+
+        out.append({
+            "method": method,
+            "k": k,
+            "seed": seed,
+            "n_validation": len(archive_rows),
+            "exact_label_match_fraction": float(
+                np.mean(ordered_predictions == archived_labels)
+            ),
+            "ari_vs_archived_assignment": float(
+                adjusted_rand_score(archived_labels, ordered_predictions)
+            ),
+        })
+    return out
+
+
+def _series_metrics(row_index: int, units_row: np.ndarray, mask_row: np.ndarray, meta: dict[str, Any]):
+    observed = np.asarray(mask_row, dtype=bool)
+    live_units = np.asarray(units_row, dtype=np.int64)[observed]
+    n_live = int(live_units.size)
+    positive = live_units[live_units > 0]
+    n_positive = int(positive.size)
+    total_units = int(live_units.sum())
+
+    def recent_stats(n_days: int):
+        start = max(0, WINDOW_DAYS - n_days)
+        obs = observed[start:]
+        vals = np.asarray(units_row[start:], dtype=np.int64)
+        n_obs = int(obs.sum())
+        live = vals[obs]
+        n_pos = int(np.count_nonzero(live > 0))
+        recent_units = int(live.sum())
+        return n_obs, n_pos, (n_pos / n_obs if n_obs else None), recent_units, (recent_units / total_units if total_units else None)
+
+    recent = {n: recent_stats(n) for n in (90, 180, 365)}
+    std_pos = float(np.std(positive, ddof=1)) if n_positive > 1 else (0.0 if n_positive == 1 else None)
+    mean_pos = float(np.mean(positive)) if n_positive else None
+    cv_pos = (std_pos / mean_pos) if (std_pos is not None and mean_pos and mean_pos > 0) else None
+    last_sale_day = meta.get("last_positive_sale_d")
+    days_since_last = meta.get("days_since_last_positive_sale")
+
+    return {
+        "row_index": int(row_index),
+        "item_id": meta.get("item_id"),
+        "store_id": meta.get("store_id"),
+        "cat_id": meta.get("cat_id"),
+        "dept_id": meta.get("dept_id"),
+        "coverage_label": meta.get("coverage_label"),
+        "activity_label": meta.get("activity_label"),
+        "n_price_live_days": n_live,
+        "price_live_fraction": n_live / WINDOW_DAYS,
+        "n_positive_days": n_positive,
+        "positive_day_frequency": n_positive / n_live if n_live else None,
+        "zero_day_share": (n_live - n_positive) / n_live if n_live else None,
+        "total_units_observed": total_units,
+        "mean_units_per_price_live_day": total_units / n_live if n_live else None,
+        "mean_units_per_positive_day": mean_pos,
+        "median_units_per_positive_day": float(np.median(positive)) if n_positive else None,
+        "std_units_per_positive_day": std_pos,
+        "cv_positive_units": cv_pos,
+        "first_price_live_d": meta.get("first_price_live_d"),
+        "days_since_last_positive_sale": days_since_last,
+        "last_positive_sale_d": last_sale_day,
+        "n_observed_last_90d": recent[90][0],
+        "positive_frequency_last_90d": recent[90][2],
+        "units_last_90d": recent[90][3],
+        "units_share_last_90d": recent[90][4],
+        "n_observed_last_180d": recent[180][0],
+        "positive_frequency_last_180d": recent[180][2],
+        "units_last_180d": recent[180][3],
+        "units_share_last_180d": recent[180][4],
+        "n_observed_last_365d": recent[365][0],
+        "positive_frequency_last_365d": recent[365][2],
+        "units_last_365d": recent[365][3],
+        "units_share_last_365d": recent[365][4],
+        "is_constant_log1p_shape": bool(n_live < 2 or np.std(np.log1p(live_units)) < 1e-8),
+    }
+
+
+def _feature_summary(records: list[dict[str, Any]], candidate: str, k: int) -> list[dict[str, Any]]:
+    numeric = [
+        "n_price_live_days", "price_live_fraction", "positive_day_frequency", "zero_day_share",
+        "total_units_observed", "mean_units_per_price_live_day", "mean_units_per_positive_day",
+        "median_units_per_positive_day", "cv_positive_units", "days_since_last_positive_sale",
+        "positive_frequency_last_90d", "positive_frequency_last_180d", "positive_frequency_last_365d",
+        "units_share_last_90d", "units_share_last_180d", "units_share_last_365d",
+    ]
+    results = []
+    clusters = sorted({int(r["consensus_cluster"]) for r in records})
+    for cluster in clusters:
+        cluster_members = [r for r in records if int(r["consensus_cluster"]) == cluster]
+        for role in ("combined", "train", "validation"):
+            members = cluster_members if role == "combined" else [r for r in cluster_members if r["sample_role"] == role]
+            n = len(members)
+            for metric in numeric:
+                vals = np.asarray(
+                    [float(r[metric]) for r in members if r.get(metric) is not None and np.isfinite(float(r[metric]))],
+                    dtype=np.float64,
+                )
+                results.append({
+                    "solution": candidate, "k": k, "cluster": int(cluster), "sample_role": role,
+                    "n_series": n, "metric": metric, "n_valid": int(len(vals)),
+                    "mean": float(np.mean(vals)) if len(vals) else None,
+                    "median": float(np.median(vals)) if len(vals) else None,
+                    "q25": float(np.quantile(vals, 0.25)) if len(vals) else None,
+                    "q75": float(np.quantile(vals, 0.75)) if len(vals) else None,
+                })
+    return results
+
+
+def _build_profiles(candidate: str, k: int, cluster_rows: dict[int, list[int]], units: np.ndarray,
+                    log_sales: np.ndarray, mask: np.ndarray, date_values: list[date]):
+    profile_rows: list[dict[str, Any]] = []
+    for cluster, rows in sorted(cluster_rows.items()):
+        matrix = np.full((len(rows), WINDOW_DAYS), np.nan, dtype=np.float32)
+        for i, row in enumerate(rows):
+            row_mask = mask[row]
+            x = np.asarray(log_sales[row, row_mask], dtype=np.float64)
+            mean = float(np.mean(x))
+            scale = float(np.std(x))
+            z = np.zeros_like(x) if scale < 1e-8 else (x - mean) / scale
+            latest_first = z[::-1]
+            matrix[i, :len(latest_first)] = latest_first.astype(np.float32)
+            # Summarize each lag independently so fully padded columns do not emit
+        # all-NaN quantile warnings or create misleading values.
+        for lag in range(WINDOW_DAYS):
+            vals = matrix[np.isfinite(matrix[:, lag]), lag].astype(np.float64)
+            n_contrib = int(vals.size)
+            if n_contrib == 0:
+                continue
+            day_index = WINDOW_DAYS - 1 - lag
+            profile_rows.append({
+                "solution": candidate, "k": k, "cluster": int(cluster),
+                "d_num": int(WINDOW_START_D + day_index),
+                "date": date_values[day_index],
+                "days_before_cutoff": int(lag),
+                "n_series_contributing": n_contrib,
+                "cluster_size": len(rows),
+                "coverage_fraction_at_day": n_contrib / len(rows),
+                "mean_normalized_log1p": float(np.mean(vals)),
+                "median_normalized_log1p": float(np.median(vals)),
+                "q25_normalized_log1p": float(np.quantile(vals, 0.25)),
+                "q75_normalized_log1p": float(np.quantile(vals, 0.75)),
+                "std_normalized_log1p": float(np.std(vals)),
+            })
+    return profile_rows
+
+
+def _build_weekday_profiles(candidate: str, k: int, cluster_rows: dict[int, list[int]],
+                            units: np.ndarray, mask: np.ndarray, date_values: list[date]):
+    # Pooled totals and unweighted per-series medians are both reported.
+    weekday = np.asarray([d.weekday() for d in date_values], dtype=np.int8)
+    records: list[dict[str, Any]] = []
+    for cluster, rows in sorted(cluster_rows.items()):
+        for wd in range(7):
+            pooled_live = pooled_pos = pooled_units = 0
+            per_series_freq: list[float] = []
+            per_series_mean: list[float] = []
+            per_series_pos_mean: list[float] = []
+            for row in rows:
+                idx = (weekday == wd) & mask[row]
+                vals = np.asarray(units[row], dtype=np.int64)[idx]
+                if vals.size == 0:
+                    continue
+                npos = int(np.count_nonzero(vals > 0))
+                pooled_live += int(vals.size)
+                pooled_pos += npos
+                pooled_units += int(vals.sum())
+                per_series_freq.append(npos / len(vals))
+                per_series_mean.append(float(np.mean(vals)))
+                if npos:
+                    per_series_pos_mean.append(float(np.mean(vals[vals > 0])))
+            records.append({
+                "solution": candidate, "k": k, "cluster": int(cluster),
+                "weekday_index_monday0": wd, "weekday": WEEKDAY_NAMES[wd],
+                "n_series_with_weekday_observations": len(per_series_freq),
+                "pooled_observed_days": pooled_live,
+                "pooled_positive_days": pooled_pos,
+                "pooled_positive_day_frequency": pooled_pos / pooled_live if pooled_live else None,
+                "pooled_mean_units_per_observed_day": pooled_units / pooled_live if pooled_live else None,
+                "pooled_mean_units_per_positive_day": pooled_units / pooled_pos if pooled_pos else None,
+                "median_series_positive_day_frequency": float(np.median(per_series_freq)) if per_series_freq else None,
+                "median_series_mean_units_per_observed_day": float(np.median(per_series_mean)) if per_series_mean else None,
+                "median_series_mean_units_per_positive_day": float(np.median(per_series_pos_mean)) if per_series_pos_mean else None,
+            })
+    return records
+
+
+def _composition(candidate: str, k: int, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    dimensions = ["store_id", "cat_id", "dept_id", "coverage_label", "activity_label", "sample_role"]
+    out: list[dict[str, Any]] = []
+    frame = pl.DataFrame(records)
+    total = frame.height
+    for dim in dimensions:
+        overall_counts = Counter(str(x) for x in frame[dim].to_list())
+        overall_share = {label: count / total for label, count in overall_counts.items()}
+        for cluster in sorted(frame["consensus_cluster"].unique().to_list()):
+            part = frame.filter(pl.col("consensus_cluster") == cluster)
+            counts = Counter(str(x) for x in part[dim].to_list())
+            n = part.height
+            for label, count in sorted(counts.items()):
+                share = count / n
+                base = overall_share.get(label, 0.0)
+                out.append({
+                    "solution": candidate, "k": k, "cluster": int(cluster),
+                    "dimension": dim, "value": label, "count": count,
+                    "share_within_cluster": share, "share_in_combined_sample": base,
+                    "representation_ratio": share / base if base > 0 else None,
+                })
+    return out
+
+
+def _plot_solution(out_dir: Path, candidate: str, k: int, summary: list[dict[str, Any]],
+                   profiles: list[dict[str, Any]], weekdays: list[dict[str, Any]],
+                   member_records: list[dict[str, Any]], reps: list[dict[str, Any]],
+                   date_values: list[date]):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    clusters = sorted({int(r["cluster"]) for r in summary})
+
+    # Latest-aligned normalized profiles with interquartile bands.
+    fig, axes = plt.subplots(len(clusters), 1, figsize=(12, max(3.1 * len(clusters), 4)), sharex=True)
+    if len(clusters) == 1:
+        axes = [axes]
+    profile_df = pl.DataFrame(profiles)
+    for ax, cluster in zip(axes, clusters, strict=True):
+        p = profile_df.filter(pl.col("cluster") == cluster).sort("d_num")
+        x = [_as_date(v) for v in p["date"].to_list()]
+        mean = p["mean_normalized_log1p"].to_numpy()
+        q25 = p["q25_normalized_log1p"].to_numpy()
+        q75 = p["q75_normalized_log1p"].to_numpy()
+        ax.plot(x, mean, linewidth=1.2, label="Mean normalized profile")
+        ax.fill_between(x, q25, q75, alpha=0.18, label="25th–75th percentile")
+        ax.axhline(0, linewidth=0.7, linestyle="--")
+        n = next(r["n_sample_series"] for r in summary if int(r["cluster"]) == cluster)
+        ax.set_title(f"Cluster {cluster} (n={n})")
+        ax.set_ylabel("Normalized log1p")
+        ax.grid(True, alpha=0.2)
+    axes[-1].set_xlabel("Calendar date")
+    axes[-1].xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    fig.suptitle(f"{candidate}: latest-aligned demand profiles", y=1.002)
+    fig.tight_layout()
+    fig.savefig(out_dir / "latest_aligned_demand_profiles.png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+    # Weekday profile: median across individual series rather than pooled alone.
+    fig, axes = plt.subplots(len(clusters), 1, figsize=(10, max(2.8 * len(clusters), 4)), sharex=True)
+    if len(clusters) == 1:
+        axes = [axes]
+    wd_df = pl.DataFrame(weekdays)
+    for ax, cluster in zip(axes, clusters, strict=True):
+        p = wd_df.filter(pl.col("cluster") == cluster).sort("weekday_index_monday0")
+        y = p["median_series_positive_day_frequency"].to_numpy()
+        ax.plot(WEEKDAY_NAMES, y, marker="o")
+        ax.set_ylim(0, 1)
+        ax.set_ylabel("Positive-day freq.")
+        ax.set_title(f"Cluster {cluster}")
+        ax.grid(True, alpha=0.2)
+    axes[-1].set_xlabel("Day of week")
+    fig.suptitle(f"{candidate}: weekday demand behaviour", y=1.002)
+    fig.tight_layout()
+    fig.savefig(out_dir / "weekday_demand_profiles.png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+    # History length and positive-day frequency distributions.
+    frame = pl.DataFrame(member_records)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
+    hist = [frame.filter(pl.col("consensus_cluster") == c)["n_price_live_days"].to_numpy() for c in clusters]
+    freq = [frame.filter(pl.col("consensus_cluster") == c)["positive_day_frequency"].drop_nulls().to_numpy() for c in clusters]
+    axes[0].boxplot(hist, positions=np.arange(1, len(clusters) + 1), showfliers=False)
+    axes[0].set_xticks(np.arange(1, len(clusters) + 1), [str(c) for c in clusters])
+    axes[0].set_title("Observed history length by cluster")
+    axes[0].set_xlabel("Cluster")
+    axes[0].set_ylabel("Observed days")
+    axes[1].boxplot(freq, positions=np.arange(1, len(clusters) + 1), showfliers=False)
+    axes[1].set_xticks(np.arange(1, len(clusters) + 1), [str(c) for c in clusters])
+    axes[1].set_title("Positive-sales frequency by cluster")
+    axes[1].set_xlabel("Cluster")
+    axes[1].set_ylabel("Positive days / price-live days")
+    for ax in axes:
+        ax.grid(True, axis="y", alpha=0.2)
+    fig.suptitle(f"{candidate}: history and activity diagnostics")
+    fig.tight_layout()
+    fig.savefig(out_dir / "history_activity_by_cluster.png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+    # Representative series plot, normalized and latest-first but displayed chronologically.
+    if reps:
+        fig, axes = plt.subplots(len(reps), 1, figsize=(12, max(3.0 * len(reps), 4)), sharex=True)
+        if len(reps) == 1:
+            axes = [axes]
+        for ax, rep in zip(axes, reps, strict=True):
+            row = int(rep["row_index"])
+            # reconstruct from selected member record's stored profile where possible
+            vals = np.asarray(rep["normalized_latest_first"], dtype=float)
+            n = len(vals)
+            chrono = vals[::-1]
+            x = date_values[-n:]
+            ax.plot(x, chrono, linewidth=1.0)
+            ax.axhline(0, linewidth=0.7, linestyle="--")
+            cluster_id = _representative_cluster_id(rep)
+            ax.set_title(
+                f"Cluster {cluster_id} representative: {rep.get('item_id')} / {rep.get('store_id')} "
+                f"(row {row}; {n} observed days)"
+            )
+            ax.set_ylabel("Normalized log1p")
+            ax.grid(True, alpha=0.2)
+        axes[-1].set_xlabel("Calendar date")
+        axes[-1].xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+        axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+        fig.suptitle(f"{candidate}: representative validation series", y=1.002)
+        fig.tight_layout()
+        fig.savefig(out_dir / "representative_sample_series.png", dpi=160, bbox_inches="tight")
+        plt.close(fig)
+
+
+
+def _representatives(method: str, k: int, reference_seed: int,
+                     cluster_rows: dict[int, list[int]], member_records: list[dict[str, Any]],
+                     all_sequences_by_row: dict[int, np.ndarray], reference_centers: np.ndarray | None,
+                     sigma: float | None):
+    """Select validation-sample exemplars; GAK medoids use a capped candidate subset."""
+    reps: list[dict[str, Any]] = []
+    centroid_profile_rows: list[dict[str, Any]] = []
+    meta_features = {int(r["row_index"]): r for r in member_records}
+
+    if method == "dtw":
+        from tslearn.metrics import dtw
+        if reference_centers is None:
+            raise RuntimeError("Reference-seed DBA centroids were not recovered")
+        for cluster, all_candidates in sorted(cluster_rows.items()):
+            center = np.asarray(reference_centers[cluster], dtype=np.float64).reshape(-1, 1)
+            center = center[np.isfinite(center[:, 0])]
+            if not len(center):
+                continue
+            for lag, value in enumerate(center[:, 0]):
+                d_num = WINDOW_END_D - lag
+                if d_num < WINDOW_START_D:
+                    break
+                centroid_profile_rows.append({
+                    "cluster": int(cluster), "lag_days_before_cutoff": int(lag),
+                    "d_num": int(d_num), "dba_centroid_normalized_log1p": float(value),
+                    "reference_seed": int(reference_seed),
+                })
+            # Select an exemplar from the held-out validation members only.
+            validation_candidates = [r for r in all_candidates if meta_features[r]["sample_role"] == "validation"]
+            candidates = [r for r in validation_candidates if meta_features[r]["n_price_live_days"] >= 56]
+            if not candidates:
+                candidates = validation_candidates or all_candidates
+            scored = [(float(dtw(all_sequences_by_row[row], center)), row) for row in candidates]
+            distance, selected = min(scored)
+            rep = dict(meta_features[selected])
+            rep.update({
+                # Keep a canonical cluster field for representative exports/plots.
+                # The enriched member table stores this as consensus_cluster.
+                "cluster": int(cluster),
+                "representative_rule": "validation member with minimum DTW to reference-seed DBA centroid",
+                "distance_to_dba_centroid": float(distance),
+                "representative_candidate_count": len(candidates),
+                "reference_seed": reference_seed,
+                "normalized_latest_first": all_sequences_by_row[selected][:, 0].tolist(),
+            })
+            reps.append(rep)
+    else:
+        from tslearn.metrics import cdist_gak
+        from tslearn.utils import to_time_series_dataset
+        if sigma is None or not np.isfinite(sigma) or sigma <= 0:
+            raise ValueError("A valid GAK sigma is required for representative selection")
+        rng = np.random.default_rng(20261121 + k)
+        for cluster, all_candidates in sorted(cluster_rows.items()):
+            # Restrict representative search to sufficiently long validation histories,
+            # with a fallback for tiny clusters and a cap on pairwise GAK work.
+            validation_candidates = [r for r in all_candidates if meta_features[r]["sample_role"] == "validation"]
+            candidates = [r for r in validation_candidates if meta_features[r]["n_price_live_days"] >= 56]
+            if not candidates:
+                candidates = validation_candidates or all_candidates
+            max_candidates = 24
+            if len(candidates) > max_candidates:
+                candidates = sorted(rng.choice(np.asarray(candidates), size=max_candidates, replace=False).tolist())
+            X_candidates = to_time_series_dataset([all_sequences_by_row[row] for row in candidates])
+            kernel = np.asarray(cdist_gak(X_candidates, sigma=sigma, n_jobs=1), dtype=np.float64)
+            if not np.isfinite(kernel).all():
+                raise ValueError(f"GAK representative matrix contains non-finite values for cluster {cluster}")
+            mean_similarity = kernel.mean(axis=1)
+            selected = candidates[int(np.argmax(mean_similarity))]
+            rep = dict(meta_features[selected])
+            rep.update({
+                # Keep a canonical cluster field for representative exports/plots.
+                # The enriched member table stores this as consensus_cluster.
+                "cluster": int(cluster),
+                "representative_rule": "validation member with at least 56 observed days (when available) having highest mean within-candidate-pool GAK similarity",
+                "mean_within_cluster_gak_similarity": float(np.max(mean_similarity)),
+                "representative_candidate_count": len(candidates),
+                "representative_search_capped": len(all_candidates) > max_candidates,
+                "sigma_gak": float(sigma),
+                "reference_seed": reference_seed,
+                "normalized_latest_first": all_sequences_by_row[selected][:, 0].tolist(),
+            })
+            reps.append(rep)
+    return reps, centroid_profile_rows
+
+
+def _split_representative_plot_data(
+    representatives: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep sequences for plotting while exporting compact representative metadata.
+
+    The representative plot needs ``normalized_latest_first``. The metadata CSV
+    deliberately omits that variable-length sequence. These must be separate
+    dictionaries: mutating the original representative with ``pop`` removes the
+    sequence needed by the subsequent plotting function.
+    """
+    plot_records = [dict(rep) for rep in representatives]
+    metadata_records = [
+        {key: value for key, value in rep.items() if key != "normalized_latest_first"}
+        for rep in representatives
+    ]
+    return plot_records, metadata_records
+
+
+def _run_candidate(method: str, k: int, group_dir: Path, output_root: Path,
+                   units: np.ndarray, log_sales: np.ndarray, mask: np.ndarray,
+                   meta_by_row: dict[int, dict[str, Any]], date_values: list[date],
+                   search_params: dict[str, Any]):
+    from sklearn.metrics import adjusted_rand_score
+
+    method_dir, archived_assignments, sample_manifest, sample_metadata = _load_method_files(group_dir, method)
+    train_rows = [int(x) for x in sample_manifest["train_row_indices"]]
+    validation_rows = [int(x) for x in sample_manifest["validation_row_indices"]]
+    if len(train_rows) != len(set(train_rows)) or len(validation_rows) != len(set(validation_rows)):
+        raise ValueError("Duplicate row_index values found in Group A sample manifest")
+    if set(train_rows) & set(validation_rows):
+        raise ValueError("Group A training and validation samples must be disjoint")
+
+    (train_labels_by_seed, val_labels_by_seed, reference_centers, sigma,
+     train_sequences, val_sequences) = _fit_and_reconstruct(
+        method, k, method_dir, train_rows, validation_rows, log_sales, mask, search_params
+    )
+    seeds = sorted(train_labels_by_seed)
+    aligned, label_mappings, reference_seed = _combined_consensus(
+        train_rows, validation_rows, train_labels_by_seed, val_labels_by_seed, k
+    )
+    candidate_name = f"{'dtw_kmeans_dba' if method == 'dtw' else 'gak_kernel_kmeans'}_k{k}"
+    out_dir = output_root / candidate_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    aligned.write_csv(out_dir / "aligned_seed_assignments.csv")
+    label_mappings.write_csv(out_dir / "seed_label_alignment.csv")
+    reproduction = _validation_reproduction_check(
+        method, k, seeds, validation_rows, val_labels_by_seed, archived_assignments
+    )
+    pl.DataFrame(reproduction).write_csv(out_dir / "validation_reproduction_check.csv")
+
+    enriched = []
+    for rec in aligned.to_dicts():
+        row = int(rec["row_index"])
+        if row not in meta_by_row:
+            raise KeyError(f"row_index={row} not found in prepared series metadata")
+        feature = _series_metrics(row, units[row], mask[row], meta_by_row[row])
+        feature.update({
+            "solution": candidate_name,
+            "k": k,
+            "sample_role": rec["sample_role"],
+            "consensus_cluster": int(rec["consensus_cluster"]),
+            "consensus_votes": int(rec["consensus_votes"]),
+            "consensus_agreement": float(rec["consensus_agreement"]),
+        })
+        enriched.append(feature)
+    feature_frame = pl.DataFrame(enriched)
+    feature_frame.write_csv(out_dir / "sample_series_characterization.csv")
+
+    clusters = sorted(int(x) for x in feature_frame["consensus_cluster"].unique().to_list())
+    cluster_rows = {
+        cluster: [int(r) for r in feature_frame.filter(pl.col("consensus_cluster") == cluster)["row_index"].to_list()]
+        for cluster in clusters
+    }
+    n = feature_frame.height
+    cluster_summary = []
+    for cluster in clusters:
+        part = feature_frame.filter(pl.col("consensus_cluster") == cluster)
+        part_records = part.to_dicts()
+        n_train = part.filter(pl.col("sample_role") == "train").height
+        n_val = part.filter(pl.col("sample_role") == "validation").height
+        def med(col: str):
+            vals = np.asarray([float(r[col]) for r in part_records if r.get(col) is not None and np.isfinite(float(r[col]))], dtype=np.float64)
+            return float(np.median(vals)) if len(vals) else None
+        history = np.asarray([int(r["n_price_live_days"]) for r in part_records], dtype=np.int32)
+        cluster_summary.append({
+            "solution": candidate_name, "method": method, "k": k, "cluster": cluster,
+            "n_sample_series": part.height, "n_train_sample": n_train, "n_validation_sample": n_val,
+            "share_combined_sample": part.height / n,
+            "median_history_days": med("n_price_live_days"),
+            "history_days_q25": float(np.quantile(history, 0.25)),
+            "history_days_q75": float(np.quantile(history, 0.75)),
+            "median_price_live_fraction": med("price_live_fraction"),
+            "full_coverage_share": sum(r["coverage_label"] == "FULL_WINDOW_PRICE_COVERAGE" for r in part_records) / part.height,
+            "left_truncated_share": sum(r["coverage_label"] == "LEFT_TRUNCATED_PRICE_HISTORY" for r in part_records) / part.height,
+            "no_positive_sales_share": sum(r["activity_label"] == "PRICE_RECORD_NO_POSITIVE_SALES" for r in part_records) / part.height,
+            "constant_shape_share": sum(bool(r["is_constant_log1p_shape"]) for r in part_records) / part.height,
+            "median_positive_day_frequency": med("positive_day_frequency"),
+            "median_zero_day_share": med("zero_day_share"),
+            "median_units_per_price_live_day": med("mean_units_per_price_live_day"),
+            "median_units_per_positive_day": med("mean_units_per_positive_day"),
+            "median_cv_positive_units": med("cv_positive_units"),
+            "median_days_since_last_positive_sale": med("days_since_last_positive_sale"),
+            "median_positive_frequency_last_90d": med("positive_frequency_last_90d"),
+            "median_positive_frequency_last_365d": med("positive_frequency_last_365d"),
+            "mean_consensus_agreement": float(part["consensus_agreement"].mean()),
+            "share_full_seed_agreement": part.filter(pl.col("consensus_agreement") == 1.0).height / part.height,
+        })
+    pl.DataFrame(cluster_summary).write_csv(out_dir / "cluster_characterization_summary.csv")
+
+    comp_rows = _composition(candidate_name, k, enriched)
+    pl.DataFrame(comp_rows).write_csv(out_dir / "cluster_composition.csv")
+    metric_rows = _feature_summary(enriched, candidate_name, k)
+    pl.DataFrame(metric_rows).write_csv(out_dir / "cluster_feature_distribution.csv")
+    profiles = _build_profiles(candidate_name, k, cluster_rows, units, log_sales, mask, date_values)
+    pl.DataFrame(profiles).write_csv(out_dir / "latest_aligned_temporal_profiles.csv")
+    weekdays = _build_weekday_profiles(candidate_name, k, cluster_rows, units, mask, date_values)
+    pl.DataFrame(weekdays).write_csv(out_dir / "weekday_profiles.csv")
+
+    all_sequences = train_sequences + val_sequences
+    sequences_by_row = {row: seq for row, seq in zip(train_rows + validation_rows, all_sequences, strict=True)}
+    reps, centroid_profile_rows = _representatives(
+        method, k, reference_seed, cluster_rows, enriched, sequences_by_row,
+        reference_centers, sigma,
+    )
+    representative_series = []
+    # Keep the variable-length sequence in the plotting records, but omit it
+    # from the compact representative metadata CSV.
+    representative_plot_records, representative_meta = _split_representative_plot_data(reps)
+    for rep, plot_rep in zip(reps, representative_plot_records, strict=True):
+        seq = np.asarray(plot_rep["normalized_latest_first"], dtype=float)
+        for lag, value in enumerate(seq):
+            d_num = WINDOW_END_D - lag
+            if d_num < WINDOW_START_D:
+                break
+            representative_series.append({
+                "solution": candidate_name, "cluster": int(rep["consensus_cluster"]),
+                "row_index": int(rep["row_index"]), "sample_role": rep["sample_role"],
+                "d_num": int(d_num), "date": date_values[d_num - WINDOW_START_D],
+                "days_before_cutoff": int(lag), "normalized_log1p": float(value),
+            })
+    pl.DataFrame(representative_meta).write_csv(out_dir / "representative_series.csv")
+    pl.DataFrame(representative_series).write_csv(out_dir / "representative_series_profiles.csv")
+    if centroid_profile_rows:
+        pl.DataFrame(centroid_profile_rows).write_csv(out_dir / "dba_centroid_profiles.csv")
+
+    _plot_solution(out_dir, candidate_name, k, cluster_summary, profiles, weekdays,
+                   enriched, representative_plot_records, date_values)
+
+    warnings = []
+    for row in cluster_summary:
+        if row["n_sample_series"] < 10:
+            warnings.append(f"Cluster {row['cluster']} has fewer than 10 combined train+validation sample members; characterization is fragile.")
+        if row["mean_consensus_agreement"] < 0.8:
+            warnings.append(f"Cluster {row['cluster']} has mean seed-consensus agreement below 0.80.")
+        if row["median_history_days"] is not None and row["median_history_days"] < 180:
+            warnings.append(f"Cluster {row['cluster']} has median history shorter than 180 days.")
+    reproduction_ari = [x["ari_vs_archived_assignment"] for x in reproduction]
+    result = {
+        "solution": candidate_name, "method": method, "k": k,
+        "n_train_sample": len(train_rows), "n_validation_sample": len(validation_rows),
+        "n_combined_sample": n, "seeds": seeds, "reference_seed": reference_seed,
+        "cluster_sizes_combined_sample": {str(x["cluster"]): int(x["n_sample_series"]) for x in cluster_summary},
+        "validation_reproduction_ari_mean": float(np.mean(reproduction_ari)),
+        "validation_reproduction_ari_min": float(np.min(reproduction_ari)),
+        "warnings": warnings,
+        "scope": "combined pilot training+validation sample characterization; not a full-population clustering result",
+        "representative_method": "validation/training sample member nearest reference-seed DBA centroid" if method == "dtw" else "sample medoid by within-cluster GAK similarity",
+        "search_hyperparameters_source": search_params["source"],
+    }
+    _write_json(out_dir / "characterization_manifest.json", result)
+    print(f"  Characterized {candidate_name}: {len(train_rows)} train + {len(validation_rows)} validation series")
+    print(f"    Validation prediction reproduction ARI: mean={result['validation_reproduction_ari_mean']:.4f}, min={result['validation_reproduction_ari_min']:.4f}")
+    for warning in warnings:
+        print(f"    NOTE: {warning}")
+    return result
+
+
+def _smoke_test():
+    # Exercise the label matching / consensus logic without reading M5 data.
+    assignments = pl.DataFrame({
+        "k": [2] * 18,
+        "seed": [42] * 6 + [43] * 6 + [44] * 6,
+        "row_index": list(range(6)) * 3,
+        "cluster": [0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0],
+    })
+    aligned, maps, seeds, ref = _consensus_assignments(assignments, 2, "smoke", list(range(6)))
+    if aligned.height != 6 or aligned["consensus_agreement"].min() < 1.0:
+        raise RuntimeError("Label alignment/consensus smoke test failed")
+    print("M5 Group A characterization smoke test passed")
+    print(f"  Seeds aligned: {seeds}; reference seed: {ref}")
+    print(f"  Validation records: {aligned.height}; minimum consensus agreement: {aligned['consensus_agreement'].min():.3f}")
+    print("  Cluster-label permutation alignment: passed")
+
+
+def _run(args):
+    input_dir = args.input_dir
+    group_dir = args.group_a_dir
+    output_root = args.output_dir
+    units, log_sales, mask, metadata, meta_by_row, date_values, lengths = _load_inputs(input_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    candidate_specs = [("dtw", 3)] if args.method in {"all", "dtw"} else []
+    if args.method in {"all", "gak"}:
+        candidate_specs.extend([("gak", k) for k in DEFAULT_GAK_K])
+
+    manifest = {
+        "script": Path(__file__).name,
+        "window": {"start_d": WINDOW_START_D, "end_d": WINDOW_END_D, "days": WINDOW_DAYS},
+        "input_dir": str(input_dir),
+        "group_a_dir": str(group_dir),
+        "output_dir": str(output_root),
+        "population": {"n_total": int(units.shape[0]), "n_with_observations": int(np.count_nonzero(lengths)), "n_without_observation_history": int(np.count_nonzero(lengths == 0))},
+        "candidates": [],
+        "methodological_notes": [
+            "The original pilot models are deterministically reconstructed on their saved training samples to recover training assignments and representative models; validation predictions are checked against archived assignments.",
+            "Seed labels are aligned to seed 42 using training assignments and Hungarian matching; majority vote yields consensus labels for both train and validation samples.",
+            "Demand profiles use per-series z-normalized log1p sales, aligned latest-first (d_1387 is common endpoint).",
+            "Raw-unit and occurrence metrics are computed from sales_units and observation_mask.",
+            "All summaries describe method-specific validation samples, not the full M5 population.",
+        ],
+    }
+    results = []
+    search_params = _load_search_hyperparameters(group_dir, group_dir)
+    manifest["search_hyperparameters"] = search_params
+    for method, k in candidate_specs:
+        result = _run_candidate(method, k, group_dir, output_root, units, log_sales, mask,
+                                meta_by_row, date_values, search_params)
+        results.append(result)
+    manifest["candidates"] = results
+    _write_json(output_root / "group_a_characterization_manifest.json", manifest)
+    print("\nGroup A characterization complete")
+    print(f"  Candidate solutions: {len(results)}")
+    print(f"  Total M5 series retained in source metadata: {units.shape[0]:,}")
+    print(f"  Output: {output_root}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Characterize selected Group A tslearn M5 cluster solutions")
+    parser.add_argument("--stage", choices=["smoke-test", "characterize"], default="smoke-test")
+    parser.add_argument("--method", choices=["all", "dtw", "gak"], default="all")
+    parser.add_argument("--input-dir", type=Path, default=Path("data/processed/clustering/d1387_728d"))
+    parser.add_argument("--group-a-dir", type=Path, default=Path("data/processed/clustering/d1387_728d/group_a_tslearn"))
+    parser.add_argument("--output-dir", type=Path, default=Path("data/processed/clustering/d1387_728d/group_a_tslearn/characterization"))
+    args = parser.parse_args()
+    if args.stage == "smoke-test":
+        _smoke_test()
+    else:
+        _run(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        if "--debug" in sys.argv:
+            traceback.print_exc()
+        raise
